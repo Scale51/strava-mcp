@@ -23,7 +23,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "start": "npm run build && node http-wrapper.js"
+    "start": "npm run build && node http-wrapper.js",
     "dev": "tsx src/server.ts",
     "lint": "eslint . --ext .ts",
     "setup-auth": "tsx scripts/setup-auth.ts",
