@@ -1,68 +1,105 @@
-'use strict';
+import express from 'express';
+import { spawn } from 'child_process';
+import { randomUUID } from 'crypto';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 
-/**
- * APEX Coach — Strava MCP HTTP Wrapper
- *
- * Bridges the strava-mcp stdio transport to the MCP HTTP/SSE transport
- * so it can be deployed on Railway and connected to Anthropic Managed Agents.
- *
- * MCP HTTP/SSE transport:
- *   GET  /sse                        → establishes an SSE session
- *   POST /messages?sessionId=<id>    → sends a JSON-RPC message to the session
- *   GET  /health                     → health check for Railway
- *
- * Each SSE connection spawns one strava-mcp child process.
- * Messages from the client (POST /messages) are written to the child's stdin.
- * Responses from the child (stdout) are forwarded back via SSE.
- *
- * Deploy: Railway detects Node.js, runs `npm run build` then `npm start`.
- * Port:   Railway assigns $PORT automatically — wrapper listens on it.
- * URL:    Add the Railway-generated domain to Anthropic Managed Agents as
- *         the strava MCP server URL (no port needed — Railway handles it).
- */
-
-const express = require('express');
-const { spawn }  = require('child_process');
-const { randomUUID } = require('crypto');
-const path = require('path');
-
+const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.use(express.json());
 
-// ── Session store ──────────────────────────────────────────────────────────────
-// Map<sessionId, { res: Response, mcpProcess: ChildProcess, buffer: string }>
+// Active sessions: Map<sessionId, { res, mcpProcess, buffer }>
 const sessions = new Map();
 
-// ── Helper: spawn one strava-mcp process ───────────────────────────────────────
 function spawnMcpProcess() {
-  const bin = path.join(__dirname, 'dist', 'server.js');
-
-  const child = spawn(process.execPath, [bin], {
-    env: {
-      // All Railway Variables are inherited automatically.
-      // Strava credentials (STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET,
-      // STRAVA_REFRESH_TOKEN) are set in Railway → Variables.
-      ...process.env,
-      // Disable the browser-based OAuth flow (we use env-var auth only).
-      STRAVA_NO_BROWSER_AUTH: '1',
-    },
+  return spawn(process.execPath, [join(__dirname, 'dist', 'server.js')], {
+    env: { ...process.env, STRAVA_NO_BROWSER_AUTH: '1' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
-
-  return child;
 }
 
-// ── GET /sse — establish an MCP session ───────────────────────────────────────
 app.get('/sse', (req, res) => {
   const sessionId = randomUUID();
 
-  // Standard SSE headers
   res.setHeader('Content-Type',  'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection',    'keep-alive');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.flushHeaders();
 
+  res.write(`event: endpoint\ndata: /messages?sessionId=${sessionId}\n\n`);
+
+  const mcpProcess = spawnMcpProcess();
+  const session = { res, mcpProcess, buffer: '' };
+  sessions.set(sessionId, session);
+
+  console.log(`[${sessionId.slice(0,8)}] session opened — pid ${mcpProcess.pid}`);
+
+  mcpProcess.stderr.on('data', (chunk) => {
+    process.stdout.write(`[mcp] ${chunk.toString('utf8')}`);
+  });
+
+  mcpProcess.stdout.on('data', (chunk) => {
+    session.buffer += chunk.toString('utf8');
+    const nl = session.buffer.lastIndexOf('\n');
+    if (nl === -1) return;
+
+    const complete = session.buffer.slice(0, nl);
+    session.buffer  = session.buffer.slice(nl + 1);
+
+    for (const line of complete.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        JSON.parse(trimmed);
+        res.write(`data: ${trimmed}\n\n`);
+      } catch {
+        console.log(`[wrapper] non-JSON line skipped: ${trimmed}`);
+      }
+    }
+  });
+
+  mcpProcess.on('exit', (code, signal) => {
+    console.log(`[${sessionId.slice(0,8)}] process exited code=${code} signal=${signal}`);
+    sessions.delete(sessionId);
+    try { res.end(); } catch { /* ignore */ }
+  });
+
+  mcpProcess.on('error', (err) => {
+    console.error(`[wrapper] spawn error: ${err.message}`);
+    sessions.delete(sessionId);
+    try { res.end(); } catch { /* ignore */ }
+  });
+
+  req.on('close', () => {
+    sessions.delete(sessionId);
+    try { mcpProcess.kill('SIGTERM'); } catch { /* ignore */ }
+  });
+});
+
+app.post('/messages', (req, res) => {
+  const { sessionId } = req.query;
+  if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+
+  const session = sessions.get(sessionId);
+  if (!session) return res.status(404).json({ error: `Session not found: ${sessionId}` });
+
+  try {
+    session.mcpProcess.stdin.write(JSON.stringify(req.body) + '\n', 'utf8');
+    res.status(202).send('Accepted');
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to forward message' });
+  }
+});
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', service: 'strava-mcp-http-wrapper', sessions: sessions.size });
+});
+
+const PORT = parseInt(process.env.PORT || '3000', 10);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Strava MCP HTTP wrapper running on port ${PORT}`);
+});
   // Tell the client which URL to use for posting messages
   res.write(`event: endpoint\ndata: /messages?sessionId=${sessionId}\n\n`);
 
