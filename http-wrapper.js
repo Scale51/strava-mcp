@@ -11,6 +11,105 @@ app.use(express.json());
 
 const sessions = new Map();
 
+// ── RESPONSE FILTER ────────────────────────────────────────────────────────────
+// Strips expensive Strava fields before forwarding to the agent.
+// Reduces token cost by ~80% — removes GPS, splits, segments, laps.
+
+const STRIP_FIELDS = new Set([
+  'map',                    // GPS polyline — largest single field
+  'splits_metric',          // per-km splits with HR/pace/elevation
+  'splits_standard',        // same in miles
+  'laps',                   // lap-by-lap breakdown arrays
+  'segment_efforts',        // matched Strava segments
+  'best_efforts',           // personal record segments
+  'photos',
+  'highlighted_kudosers',
+  'gear',
+  'device_name',
+  'embed_token',
+  'similar_activities',
+  'start_latlng',
+  'end_latlng',
+  'timezone',
+  'utc_offset',
+  'location_city',
+  'location_state',
+  'location_country',
+  'athlete_count',
+  'manual',
+  'private',
+  'resource_state',
+  'sport_type',             // duplicate of type
+  'upload_id',
+  'upload_id_str',
+  'external_id',
+  'from_accepted_tag',
+  'has_kudoed',
+  'hide_from_home',
+  'visibility',
+  'flagged',
+  'kudos_count',
+  'comment_count',
+  'achievement_count',
+]);
+
+function trimActivity(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return obj;
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (STRIP_FIELDS.has(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+function filterStravaContent(text) {
+  try {
+    const parsed = JSON.parse(text);
+
+    // Array of activities
+    if (Array.isArray(parsed)) {
+      return JSON.stringify(parsed.map(item => trimActivity(item)));
+    }
+
+    // Single activity (has id + type)
+    if (parsed && typeof parsed === 'object' && parsed.id && parsed.type) {
+      return JSON.stringify(trimActivity(parsed));
+    }
+
+    // Nested activities array
+    if (parsed && parsed.activities && Array.isArray(parsed.activities)) {
+      parsed.activities = parsed.activities.map(a => trimActivity(a));
+      return JSON.stringify(parsed);
+    }
+
+    return text; // unknown shape — pass through
+  } catch {
+    return text; // not JSON — pass through
+  }
+}
+
+function maybeFilter(jsonLine) {
+  try {
+    const msg = JSON.parse(jsonLine);
+    if (!msg.result || !Array.isArray(msg.result.content)) return jsonLine;
+
+    let modified = false;
+    msg.result.content = msg.result.content.map(block => {
+      if (block.type !== 'text' || !block.text) return block;
+      const filtered = filterStravaContent(block.text);
+      if (filtered !== block.text) { modified = true; return { ...block, text: filtered }; }
+      return block;
+    });
+
+    return modified ? JSON.stringify(msg) : jsonLine;
+  } catch {
+    return jsonLine;
+  }
+}
+
+// ── SSE SESSION ────────────────────────────────────────────────────────────────
+
 app.get('/sse', function(req, res) {
   const sessionId = randomUUID();
 
@@ -52,7 +151,7 @@ app.get('/sse', function(req, res) {
       if (!trimmed) continue;
       try {
         JSON.parse(trimmed);
-        res.write('data: ' + trimmed + '\n\n');
+        res.write('data: ' + maybeFilter(trimmed) + '\n\n');
       } catch (e) {
         console.log('non-JSON line skipped');
       }
@@ -77,6 +176,8 @@ app.get('/sse', function(req, res) {
   });
 });
 
+// ── MESSAGES ───────────────────────────────────────────────────────────────────
+
 app.post('/messages', function(req, res) {
   const sessionId = req.query.sessionId;
 
@@ -97,15 +198,19 @@ app.post('/messages', function(req, res) {
   }
 });
 
+// ── HEALTH ─────────────────────────────────────────────────────────────────────
+
 app.get('/health', function(req, res) {
   res.json({
     status: 'ok',
     service: 'strava-mcp-http-wrapper',
-    sessions: sessions.size
+    sessions: sessions.size,
+    filter: 'active — GPS/splits/laps/segments stripped'
   });
 });
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 app.listen(PORT, '0.0.0.0', function() {
   console.log('Strava MCP HTTP wrapper running on port ' + PORT);
+  console.log('Response filter: ACTIVE');
 });
