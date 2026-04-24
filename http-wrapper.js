@@ -17,8 +17,7 @@ const sessions = new Map();
 
 const STRIP_FIELDS = new Set([
   'map',                    // GPS polyline — largest single field
-  'splits_metric',          // per-km splits with HR/pace/elevation
-  'splits_standard',        // same in miles
+  'splits_standard',        // miles version — not needed (metric only)
   'laps',                   // lap-by-lap breakdown arrays
   'segment_efforts',        // matched Strava segments
   'best_efforts',           // personal record segments
@@ -58,9 +57,24 @@ function trimActivity(obj) {
   const out = {};
   for (const [k, v] of Object.entries(obj)) {
     if (STRIP_FIELDS.has(k)) continue;
+    if (k === 'splits_metric' && Array.isArray(v)) { out[k] = v.map(trimSplit); continue; }
     out[k] = v;
   }
   return out;
+}
+
+
+function trimSplit(s) {
+  // Keep only fields needed for aerobic decoupling + pace fade detection
+  return {
+    split:               s.split,               // km number
+    distance:            s.distance,            // metres
+    elapsed_time:        s.elapsed_time,        // seconds
+    moving_time:         s.moving_time,
+    average_speed:       s.average_speed,       // m/s → pace calculable
+    average_heartrate:   s.average_heartrate,
+    elevation_difference: s.elevation_difference,
+  };
 }
 
 function filterStravaContent(text) {
