@@ -4,6 +4,56 @@ import { randomUUID } from 'crypto';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
+// ── STRAVA TOKEN AUTO-REFRESH ──────────────────────────────────────────────────
+// Strava access tokens expire every 6 hours.
+// This module refreshes automatically on startup and every 5 hours.
+
+const STRAVA_CLIENT_ID     = process.env.STRAVA_CLIENT_ID;
+const STRAVA_CLIENT_SECRET = process.env.STRAVA_CLIENT_SECRET;
+const STRAVA_REFRESH_TOKEN = process.env.STRAVA_REFRESH_TOKEN;
+
+async function refreshStravaToken() {
+  if (!STRAVA_CLIENT_ID || !STRAVA_CLIENT_SECRET || !STRAVA_REFRESH_TOKEN) {
+    console.error('[Strava] Missing CLIENT_ID, CLIENT_SECRET or REFRESH_TOKEN — skipping refresh');
+    return false;
+  }
+  try {
+    const res = await fetch('https://www.strava.com/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id:     STRAVA_CLIENT_ID,
+        client_secret: STRAVA_CLIENT_SECRET,
+        refresh_token: STRAVA_REFRESH_TOKEN,
+        grant_type:    'refresh_token'
+      })
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      console.error('[Strava] Token refresh failed:', res.status, err);
+      return false;
+    }
+    const data = await res.json();
+    if (data.access_token) {
+      process.env.STRAVA_ACCESS_TOKEN  = data.access_token;
+      process.env.STRAVA_REFRESH_TOKEN = data.refresh_token || STRAVA_REFRESH_TOKEN;
+      const exp = new Date(data.expires_at * 1000).toISOString();
+      console.error('[Strava] Token refreshed OK — expires ' + exp);
+      return true;
+    }
+    console.error('[Strava] Unexpected refresh response:', JSON.stringify(data));
+    return false;
+  } catch (e) {
+    console.error('[Strava] Token refresh error:', e.message);
+    return false;
+  }
+}
+
+// Refresh on startup + every 5 hours
+refreshStravaToken();
+setInterval(refreshStravaToken, 5 * 60 * 60 * 1000);
+
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const app = express();
@@ -215,11 +265,14 @@ app.post('/messages', function(req, res) {
 // ── HEALTH ─────────────────────────────────────────────────────────────────────
 
 app.get('/health', function(req, res) {
+  const tok = process.env.STRAVA_ACCESS_TOKEN || '';
   res.json({
-    status: 'ok',
-    service: 'strava-mcp-http-wrapper',
-    sessions: sessions.size,
-    filter: 'active — GPS/splits/laps/segments stripped'
+    status:        'ok',
+    service:       'strava-mcp-http-wrapper',
+    sessions:      sessions.size,
+    filter:        'active — GPS/splits/laps/segments stripped',
+    token_set:     tok.length > 0,
+    token_preview: tok ? tok.slice(0,8)+'...' : 'MISSING'
   });
 });
 
