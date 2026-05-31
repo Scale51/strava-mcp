@@ -181,9 +181,15 @@ app.get('/sse', function(req, res) {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('X-Accel-Buffering', 'no');  // Railway/nginx: Pufferung deaktivieren
   res.flushHeaders();
 
   res.write('event: endpoint\ndata: /messages?sessionId=' + sessionId + '\n\n');
+
+  // Keepalive-Ping alle 25s — verhindert Proxy-Timeout und Client-Disconnect
+  const keepaliveTimer = setInterval(function() {
+    try { res.write(': keepalive\n\n'); } catch (e) { clearInterval(keepaliveTimer); }
+  }, 25000);
 
   const mcpBin = join(__dirname, 'dist', 'server.js');
   const mcpProcess = spawn(process.execPath, [mcpBin], {
@@ -223,6 +229,7 @@ app.get('/sse', function(req, res) {
   });
 
   mcpProcess.on('exit', function(code) {
+    clearInterval(keepaliveTimer);  // Ping stoppen
     console.log('MCP process exited code=' + code);
     sessions.delete(sessionId);
     try { res.end(); } catch (e) { /* ignore */ }
@@ -235,6 +242,7 @@ app.get('/sse', function(req, res) {
   });
 
   req.on('close', function() {
+    clearInterval(keepaliveTimer);  // Ping stoppen
     sessions.delete(sessionId);
     try { mcpProcess.kill('SIGTERM'); } catch (e) { /* ignore */ }
   });
